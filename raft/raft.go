@@ -3,11 +3,14 @@ package raft
 import "fmt"
 
 type Server struct {
+    // We will use net/rpc to make this work
+
 	// Persistent state. This should be written to stable storage before
 	// responding to RPCs.
 	state    leadership // Leadership state of the server.
 	cur      term       // Monotonically increases when a new leader is elected.
 	votedFor int        // Updated when the server votes for a candidate.
+	log      log        // Each entry contains command for state machine, and term when entry was received by leader.
 
 	// Volatile state.
 	commitIndex index // Highest log entry known to be committed. Increases monotonically.
@@ -18,9 +21,22 @@ type Server struct {
 	matchIndex []index // For each server, highest log entry known to be replicated on that server. Increases monotonically.
 }
 
-func (s Server) String() string {
+func (s *Server) String() string {
 	return fmt.Sprintf("server is a %s. It is %s. It voted for %d.", s.state, s.cur, s.votedFor)
 }
+
+func (s *Server) ListenAndServe() {
+}
+
+// Contains a command for state machine, and term when entry was received by leader.
+type entry struct {
+	received term // When entry was received by leader.
+	c        cmd  // Command for state machine.
+}
+type log []entry
+
+// This is a TBD. I'm still not sure what the state-machine here will look like.
+type cmd struct{}
 
 type leadership int
 
