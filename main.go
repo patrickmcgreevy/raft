@@ -11,4 +11,5 @@ func main() {
     for i := range servers {
         fmt.Println(servers[i])
     }
+    fmt.Println(servers[0].ListenAndServe())
 }
