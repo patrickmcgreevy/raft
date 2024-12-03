@@ -25,41 +25,63 @@ type Server struct {
 	// Volatile state on leaders. It should be reinitialized after election.
 	nextIndex  []index // For each server, the next log entry to send to that server. Initialized to leader last log inex +1
 	matchIndex []index // For each server, highest log entry known to be replicated on that server. Increases monotonically.
+
+	// Not state defined by the algorithm. But it refers to an election timer.
+	electionTimer <-chan time.Time
 }
 
 func (s *Server) ListenAndServe() error {
 	err := rpc.Register(s)
 	if err != nil {
-		fmt.Println(fmt.Errorf("cannot start raft server: %w", err))
 		return fmt.Errorf("cannot start raft server: %w", err)
 	}
 	l, err := net.Listen("unix", s.Address())
 	if err != nil {
-		fmt.Println( fmt.Errorf("cannot start raft server: %w", err))
 		return fmt.Errorf("cannot start raft server: %w", err)
 	}
-    unixListener := l.(*net.UnixListener)
-    unixListener.SetUnlinkOnClose(true)
-    unixListener.SetDeadline(time.Now().Add(10*time.Second))
-    defer unixListener.Close()
+	unixListener := l.(*net.UnixListener)
+	unixListener.SetUnlinkOnClose(true)
+	defer unixListener.Close()
+	s.resetElectionTimer()
 
 	for {
-        rpc.Accept(unixListener)
-        return nil
-
 		// All Servers:
 		//  • If commitIndex > lastApplied: increment lastApplied, apply
 		//      log[lastApplied] to state machine (§5.3)
 		//  • If RPC request or response contains term T > currentTerm:
 		//      set currentTerm = T, convert to follower (§5.1)
+		if s.commitIndex > s.lastApplied {
+			s.lastApplied++
+		}
+		// TODO: apply last log to state machine.
+		// TODO: how do I do the convert to follower thing??
 
 		switch s.state {
 		case follower:
 			// Followers (§5.2):
 			//  • Respond to RPCs from candidates and leaders
 			//  • If election timeout elapses without receiving AppendEntries
-			// RPC from current leader or granting vote to candidate:
-			// convert to candidate
+			//      RPC from current leader or granting vote to candidate:
+			//      convert to candidate
+			conn, err := unixListener.Accept()
+			if err != nil {
+				// The timeout just means that we think the leader is dead.
+				// Therefore, we start a new election.
+				if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+					s.state = candidate
+					continue
+				}
+				// Now this is an unhandled error. DIE! But don't panic.
+				return fmt.Errorf("raft server died unexpectedly: %w", err)
+			}
+			rpc.ServeConn(conn)
+			conn.Close()
+			select {
+			case <-s.electionTimer:
+				// This just means that we think the leader is dead.
+				// Therefore, we start a new election.
+				s.state = candidate
+			}
 		case candidate:
 			// Candidates (§5.2):
 			//     • On conversion to candidate, start election:
@@ -91,6 +113,10 @@ func (s *Server) ListenAndServe() error {
 	}
 
 	return nil
+}
+
+func (s *Server) resetElectionTimer() {
+	s.electionTimer = time.NewTimer(electionTimeout).C
 }
 
 func (s *Server) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) (err error) {
@@ -133,19 +159,28 @@ func (s *Server) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply
 		s.commitIndex = min(args.LeaderCommit, index(len(args.Entries)-1))
 	}
 
+	// If I get this RPC, is it guaranteed to be from the leader?
+	s.resetElectionTimer()
+
 	return nil
 }
 
 func (s *Server) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-    reply.CurTerm = s.cur
-    if args.CandidateTerm < s.cur {
-        reply.VoteGranted = false
-        return fmt.Errorf("candidate %d's log is behind server %d's", args.CandidateId, s.id)
-    }
+	reply.CurTerm = s.cur
+	if args.CandidateTerm < s.cur {
+		reply.VoteGranted = false
+		return fmt.Errorf("candidate %d's log is behind server %d's", args.CandidateId, s.id)
+	}
 
-    if s.votedFor == 0 || s.votedFor == args.CandidateId {
-        reply.VoteGranted = true
-    }
+	if s.votedFor == 0 || s.votedFor == args.CandidateId {
+		reply.VoteGranted = true
+	}
+
+	// Should I only reset the timer if s is a follower?
+	// The algorithm requires us to reset the electionTimer when we grant a vote.
+	if reply.VoteGranted == true {
+		s.resetElectionTimer()
+	}
 
 	return nil
 }
@@ -176,10 +211,10 @@ type AppendEntriesReply struct {
 
 // For usage with net/rpc package.
 type RequestVoteArgs struct {
-	CandidateId  int   // Leader's id.
-	CandidateTerm  term  // The requesting candidates term.
-	LastLogIndex index // Index of candidate's last log entry.
-	LastLogTerm  term  // Term of candidate's last log entry.
+	CandidateId   int   // Leader's id.
+	CandidateTerm term  // The requesting candidates term.
+	LastLogIndex  index // Index of candidate's last log entry.
+	LastLogTerm   term  // Term of candidate's last log entry.
 }
 
 // For usage with net/rpc package.
@@ -210,6 +245,8 @@ const (
 	leader
 	follower
 )
+
+const electionTimeout time.Duration = 30 * time.Second
 
 func (l leadership) String() string {
 	switch l {

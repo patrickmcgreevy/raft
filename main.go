@@ -23,7 +23,7 @@ func main() {
     reply := raft.RequestVoteReply{}
     err = client.Call(
         "Server.RequestVote",
-        raft.RequestVoteArgs{CandidateId: 1, CandidateTerm: 1, LastLogIndex: -1, LastLogTerm: 1},
+        raft.RequestVoteArgs{CandidateId: 1, CandidateTerm: 1, LastLogIndex: -1, LastLogTerm: -1},
         &reply,
     )
     if err != nil {
