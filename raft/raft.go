@@ -4,19 +4,21 @@ import (
 	"fmt"
 	"net"
 	"net/rpc"
+	"sync"
 	"time"
 )
 
+// Names of fields within this struct are derived from the Raft paper. Therefore,
+// go idioms are ignored for algorithmic consistency.
 type Server struct {
-	// We will use net/rpc to make this work
 	id int
 
 	// Persistent state. This should be written to stable storage before
 	// responding to RPCs.
-	state    leadership // Leadership state of the server.
-	cur      term       // Monotonically increases when a new leader is elected.
-	votedFor int        // Updated when the server votes for a candidate.
-	log      log        // Each entry contains command for state machine, and term when entry was received by leader.
+	state       leadership // Leadership state of the server.
+	currentTerm term       // Monotonically increases when a new leader is elected.
+	votedFor    int        // Updated when the server votes for a candidate.
+	log         log        // Each entry contains command for state machine, and term when entry was received by leader.
 
 	// Volatile state.
 	commitIndex index // Highest log entry known to be committed. Increases monotonically.
@@ -28,6 +30,8 @@ type Server struct {
 
 	// Not state defined by the algorithm. But it refers to an election timer.
 	electionTimer <-chan time.Time
+
+	peers []*Server // The servers peers are used to reach consensus.
 }
 
 func (s *Server) ListenAndServe() error {
@@ -81,15 +85,64 @@ func (s *Server) ListenAndServe() error {
 				// This just means that we think the leader is dead.
 				// Therefore, we start a new election.
 				s.state = candidate
+			default:
+				// If the timer hasn't fired, there's nothing to do.
 			}
 		case candidate:
 			// Candidates (§5.2):
 			//     • On conversion to candidate, start election:
 			//     • Increment currentTerm
+			s.currentTerm++
 			//     • Vote for self
+			s.votedFor = s.id
 			//     • Reset election timer
+			s.resetElectionTimer()
 			//     • Send RequestVote RPCs to all other servers
+			var wg sync.WaitGroup
+			votes := 0
+			for _, peer := range s.peers {
+				wg.Add(1)
+				reply := RequestVoteReply{}
+				go func(peer *Server) {
+					defer wg.Done()
+					client, err := rpc.Dial("unix", peer.Address())
+					if err != nil {
+						fmt.Println(err)
+						return
+					}
+					var t term
+					if len(s.log) != 0 {
+						t = s.log[len(s.log)-1].received
+					}
+					err = client.Call(
+						"Server.RequestVote",
+						RequestVoteArgs{
+							CandidateId:   s.id,
+							CandidateTerm: s.currentTerm,
+							LastLogIndex:  index(max(len(s.log), 0)),
+							LastLogTerm:   t,
+						},
+						&reply,
+					)
+					if err != nil {
+						fmt.Println(err)
+						return
+					}
+                    if reply.Term > s.currentTerm {
+                        s.currentTerm = reply.Term
+                        s.state = follower
+                    }
+                    if reply.VoteGranted {
+                        votes++
+                    }
+				}(peer)
+			}
 			//     • If votes received from majority of servers: become leader
+            wg.Wait()
+            // If we received a reply from the leader, we will set our state to follower.
+            if s.state != candidate {
+                continue
+            }
 			//     • If AppendEntries RPC received from new leader: convert to
 			//         follower
 			//     • If election timeout elapses: start new election
@@ -126,25 +179,29 @@ func (s *Server) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply
 			err = fmt.Errorf("AppendEntries RPC failed: %w", err)
 		}
 	}()
-	if args.Cur < s.cur {
-		return fmt.Errorf("caller's term (%d) is less than the server's term (%d)", args.Cur, s.cur)
+    if args.Cur > s.currentTerm {
+        s.currentTerm = args.Cur
+        s.state = follower
+    }
+	if args.Cur < s.currentTerm {
+		return fmt.Errorf("caller's term (%d) is less than the server's term (%d)", args.Cur, s.currentTerm)
 	}
 
-	if int(args.PrevLog) >= len(s.log) {
-		return fmt.Errorf("the server does not have an entry at index %d", args.PrevLog)
+	if int(args.PrevLogIndex) >= len(s.log) {
+		return fmt.Errorf("the server does not have an entry at index %d", args.PrevLogIndex)
 	}
 
-	if s.log[args.PrevLog].received != args.PrevLogTerm {
+	if s.log[args.PrevLogIndex].received != args.PrevLogTerm {
 		return fmt.Errorf(
 			"the server's log entry at index %d does not have term %d: actual %s",
-			args.PrevLog,
+			args.PrevLogIndex,
 			args.PrevLogTerm,
-			s.log[args.PrevLog],
+			s.log[args.PrevLogIndex],
 		)
 	}
 
 	for i := 0; i < len(args.Entries); i++ {
-		logIndex := int(args.PrevLog) + i
+		logIndex := int(args.PrevLogIndex) + i
 		if logIndex >= len(s.log) {
 			s.log = append(s.log, args.Entries[i])
 			continue
@@ -166,8 +223,12 @@ func (s *Server) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (s *Server) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-	reply.CurTerm = s.cur
-	if args.CandidateTerm < s.cur {
+    if args.CandidateTerm > s.currentTerm {
+        s.currentTerm = args.CandidateTerm
+        s.state = follower
+    }
+	reply.Term = s.currentTerm
+	if args.CandidateTerm < s.currentTerm {
 		reply.VoteGranted = false
 		return fmt.Errorf("candidate %d's log is behind server %d's", args.CandidateId, s.id)
 	}
@@ -190,26 +251,32 @@ func (s *Server) Address() string {
 }
 
 func (s Server) String() string {
-	return fmt.Sprintf("server is a %s. It is %s. It voted for %d.", s.state, s.cur, s.votedFor)
+	return fmt.Sprintf("server is a %s. It is %s. It voted for %d.", s.state, s.currentTerm, s.votedFor)
 }
 
 // For usage with net/rpc package.
+// Names of fields within this struct are derived from the Raft paper. Therefore,
+// go idioms are ignored for algorithmic consistency.
 type AppendEntriesArgs struct {
 	Cur          term  // Leader's term.
 	LeaderId     int   // Leader ID.
-	PrevLog      index // Index of log entry immediately preceeding new ones.
+	PrevLogIndex index // Index of log entry immediately preceeding new ones.
 	PrevLogTerm  term  // Term of log entry immediately preceeding new ones.
 	Entries      log   // May be empty for heartbeat.
 	LeaderCommit index // Leader's commit index.
 }
 
 // For usage with net/rpc package.
+// Names of fields within this struct are derived from the Raft paper. Therefore,
+// go idioms are ignored for algorithmic consistency.
 type AppendEntriesReply struct {
-	Cur     term // For the leader to update himself.
+	Term    term // For the leader to update himself.
 	Success bool
 }
 
 // For usage with net/rpc package.
+// Names of fields within this struct are derived from the Raft paper. Therefore,
+// go idioms are ignored for algorithmic consistency.
 type RequestVoteArgs struct {
 	CandidateId   int   // Leader's id.
 	CandidateTerm term  // The requesting candidates term.
@@ -218,8 +285,10 @@ type RequestVoteArgs struct {
 }
 
 // For usage with net/rpc package.
+// Names of fields within this struct are derived from the Raft paper. Therefore,
+// go idioms are ignored for algorithmic consistency.
 type RequestVoteReply struct {
-	CurTerm     term // For candidate to update itself.
+	Term        term // For candidate to update itself.
 	VoteGranted bool // True indicates that candidate received vote.
 }
 
